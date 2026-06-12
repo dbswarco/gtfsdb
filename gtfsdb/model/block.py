@@ -92,7 +92,7 @@ class Block(Base):
         if stop_id is None:
             stop_id = self.end_stop_id
 
-        if self.next_trip and self.next_trip.start_stop.stop_id == stop_id:
+        if self.next_trip and self.next_trip.start_stop and self.next_trip.start_stop.stop_id == stop_id:
             # import pdb; pdb.set_trace()
             ret_val = True
         return ret_val
@@ -153,6 +153,25 @@ class Block(Base):
 
             # step 4: create block objects
             for j, k in enumerate(sorted_blocks):
+                # check for missing start or end stops separately
+                start_stop_id = None
+                end_stop_id = None
+
+                if k.start_stop is None:
+                    log.warning('Trip {0} has missing start_stop'.format(k.trip_id))
+                else:
+                    start_stop_id = k.start_stop.stop_id
+
+                if k.end_stop is None:
+                    log.warning('Trip {0} has missing end_stop'.format(k.trip_id))
+                else:
+                    end_stop_id = k.end_stop.stop_id
+
+                # skip only if both are missing
+                if start_stop_id is None and end_stop_id is None:
+                    log.warning('Trip {0} has missing both start_stop and end_stop, skipping block creation'.format(k.trip_id))
+                    continue
+
                 prev = None
                 next = None
                 if j > 0:
@@ -166,8 +185,8 @@ class Block(Base):
                     trip_id=k.trip_id,
                     prev_trip_id=prev,
                     next_trip_id=next,
-                    start_stop_id=k.start_stop.stop_id,
-                    end_stop_id=k.end_stop.stop_id
+                    start_stop_id=start_stop_id,
+                    end_stop_id=end_stop_id
                 )
                 db.session.add(block)
 
