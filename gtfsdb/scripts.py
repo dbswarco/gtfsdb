@@ -126,3 +126,8 @@ def db_connect_tester():
     for st in stop_times:
         print(st.get_direction_name())
         break
+
+
+# args: https://cdn.mbta.com/MBTA_GTFS.zip -d postgresql+psycopg2://ott:ott@10.5.0.2/mbta -np -p --tables stop_times
+if __name__ == '__main__':
+    gtfsdb_load()
