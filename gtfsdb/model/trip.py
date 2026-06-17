@@ -1,7 +1,5 @@
 import logging
 
-import psutil
-
 from gtfsdb import config
 from gtfsdb.model.base import Base
 from sqlalchemy import Column, func
