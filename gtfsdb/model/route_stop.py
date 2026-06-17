@@ -149,93 +149,124 @@ class RouteStop(Base, RouteStopBase):
         part B creates the RouteStop (and potentially RouteDirections ... if not in GTFS) records
         """
         from gtfsdb import Route, RouteDirection
+        from sqlalchemy.orm import joinedload
 
         start_time = time.time()
-        routes = session.query(Route).all()
 
-        for r in routes:
-            # step 0: figure out some info about the route
-            create_directions = False
-            if r.directions is None or len(r.directions) == 0:
-                create_directions = True
+        # Get total count for batching
+        total_routes = session.query(func.count(Route.route_id)).scalar()
+        offset = 0
+        records_added = 0
 
-            # step 1a: filter the list of trips down to only a trip with a unique pattern
-            trips = []
-            shape_id_filter = []
-            for t in r.trips:
-                # a bit of a speedup to filter trips that have the same shape
-                if t.shape_id and t.shape_id in shape_id_filter:
-                    continue
-                # store our trips
-                shape_id_filter.append(t.shape_id)
-                trips.append(t)
+        while offset < total_routes:
+            # Load routes in batches with eager loading of relationships
+            routes = (session.query(Route)
+                     .options(joinedload(Route.directions))
+                     .options(joinedload(Route.trips).joinedload('stop_times'))
+                     .order_by(Route.route_id)
+                     .limit(batch_size)
+                     .offset(offset)
+                     .all())
 
-            # step 1b: sort our list of trips by length (note: for trips with two directions, ...)
-            trips = sorted(trips, key=lambda t: t.trip_len, reverse=True)
+            if not routes:
+                break
 
-            # step 2: get a hash table of route stops with effective start and end dates
-            stop_effective_dates = cls._find_route_stop_effective_dates(session, r.route_id)
+            for r in routes:
+                # step 0: figure out some info about the route
+                # Access directions before potential detachment
+                route_directions = list(r.directions) if r.directions else []
+                create_directions = len(route_directions) == 0
 
-            # PART A: we're going to just collect a list of unique stop ids for this route / directions
-            for d in [0, 1]:
-                unique_stops = []
+                # step 1a: filter the list of trips down to only a trip with a unique pattern
+                # Access trips data before it might be detached
+                route_trips = list(r.trips) if r.trips else []
+                trips = []
+                shape_id_filter = []
+                for t in route_trips:
+                    # a bit of a speedup to filter trips that have the same shape
+                    if t.shape_id and t.shape_id in shape_id_filter:
+                        continue
+                    # store our trips
+                    shape_id_filter.append(t.shape_id)
+                    # Access stop_times and cache trip_len before potential detachment
+                    t._cached_stop_times = list(t.stop_times) if t.stop_times else []
+                    t._cached_trip_len = len(t._cached_stop_times)
+                    trips.append(t)
 
-                # step 3: loop through all our trips and their stop times, pulling out a unique set of stops
-                for t in trips:
-                    if t.direction_id == d:
+                # step 1b: sort our list of trips by length (note: for trips with two directions, ...)
+                trips = sorted(trips, key=lambda t: t._cached_trip_len, reverse=True)
 
-                        # step 4: loop through this trip's stop times, and find any/all stops that are in our stop list already
-                        #         further, let's try to find the best position of that stop (e.g., look for where the stop patterns breaks)
-                        last_pos = None
-                        for i, st in enumerate(t.stop_times):
-                            # step 5a: make sure this stop that customers can actually board...
-                            if st.is_boarding_stop():
+                # step 2: get a hash table of route stops with effective start and end dates
+                stop_effective_dates = cls._find_route_stop_effective_dates(session, r.route_id)
 
-                                # step 5b: don't want arrival trips to influence route stop list
-                                if st.stop_id in unique_stops:
-                                    last_pos = unique_stops.index(st.stop_id)
-                                else:
-                                    # step 5b: add ths stop id to our unique list ... either in position, or appended to the end of the list
-                                    if last_pos:
-                                        last_pos += 1
-                                        unique_stops.insert(last_pos, st.stop_id)
+                # PART A: we're going to just collect a list of unique stop ids for this route / directions
+                for d in [0, 1]:
+                    unique_stops = []
+
+                    # step 3: loop through all our trips and their stop times, pulling out a unique set of stops
+                    for t in trips:
+                        if t.direction_id == d:
+
+                            # step 4: loop through this trip's stop times, and find any/all stops that are in our stop list already
+                            #         further, let's try to find the best position of that stop (e.g., look for where the stop patterns breaks)
+                            last_pos = None
+                            for i, st in enumerate(t._cached_stop_times):
+                                # step 5a: make sure this stop that customers can actually board...
+                                if st.is_boarding_stop():
+
+                                    # step 5b: don't want arrival trips to influence route stop list
+                                    if st.stop_id in unique_stops:
+                                        last_pos = unique_stops.index(st.stop_id)
                                     else:
-                                        unique_stops.append(st.stop_id)
+                                        # step 5b: add ths stop id to our unique list ... either in position, or appended to the end of the list
+                                        if last_pos:
+                                            last_pos += 1
+                                            unique_stops.insert(last_pos, st.stop_id)
+                                        else:
+                                            unique_stops.append(st.stop_id)
 
-                # PART B: add records to the database ...
-                if len(unique_stops) > 0:
+                    # PART B: add records to the database ...
+                    if len(unique_stops) > 0:
 
-                    # step 6: if an entry for the direction doesn't exist, create a new
-                    #         RouteDirection record and add it to this route
-                    if create_directions:
-                        rd = RouteDirection()
-                        rd.route_id = r.route_id
-                        rd.direction_id = d
-                        rd.direction_name = "Outbound" if d == 0 else "Inbound"
-                        session.add(rd)
+                        # step 6: if an entry for the direction doesn't exist, create a new
+                        #         RouteDirection record and add it to this route
+                        if create_directions:
+                            rd = RouteDirection()
+                            rd.route_id = r.route_id
+                            rd.direction_id = d
+                            rd.direction_name = "Outbound" if d == 0 else "Inbound"
+                            session.add(rd)
 
-                    # step 7: create new RouteStop records
-                    for k, stop_id in enumerate(unique_stops):
-                        # step 7: create a RouteStop record
-                        rs = RouteStop()
-                        rs.route_id = r.route_id
-                        rs.direction_id = d
-                        rs.stop_id = stop_id
-                        rs.order = k + 1
-                        s, e = cls._get_stop_effective_dates(stop_effective_dates, stop_id)
-                        rs.start_date = s
-                        rs.end_date = e
-                        if rs.is_valid():
-                            session.add(rs)
-                        else:
-                            log.info("{0} is not valid ... not adding to the database".format(rs.get_id()))
+                        # step 7: create new RouteStop records
+                        for k, stop_id in enumerate(unique_stops):
+                            # step 7: create a RouteStop record
+                            rs = RouteStop()
+                            rs.route_id = r.route_id
+                            rs.direction_id = d
+                            rs.stop_id = stop_id
+                            rs.order = k + 1
+                            s, e = cls._get_stop_effective_dates(stop_effective_dates, stop_id)
+                            rs.start_date = s
+                            rs.end_date = e
+                            if rs.is_valid():
+                                session.add(rs)
+                                records_added += 1
+                            else:
+                                log.info("{0} is not valid ... not adding to the database".format(rs.get_id()))
 
-            # step 8: commit the new records to the db for this route...
+                    # step 8: commit records periodically within route processing
+                    if records_added >= 1000:
+                        sys.stdout.write('*')
+                        session.commit()
+                        session.flush()
+                        records_added = 0
+
+            # Commit this batch and move to next
             sys.stdout.write('*')
             session.commit()
-
-            # Clear session to free memory
+            session.flush()
             session.expunge_all()
+            offset += batch_size
 
         # step 9: final commit for any stragglers
         session.commit()
@@ -386,22 +417,39 @@ class CurrentRouteStops(Base, RouteStopBase):
                 date = None
                 filter = False
 
-            rs_list = session.query(RouteStop).all()
+            # Process in batches instead of loading all at once
+            total_rs = session.query(func.count(RouteStop.id)).scalar()
+            offset = 0
             count = 0
-            for rs in rs_list:
-                if filter and not rs.is_active(date):
-                    continue
 
-                c = CurrentRouteStops(rs)
-                session.add(c)
-                count += 1
+            while offset < total_rs:
+                rs_batch = (session.query(RouteStop)
+                           .order_by(RouteStop.id)
+                           .limit(batch_size)
+                           .offset(offset)
+                           .all())
 
-                # Commit in batches to avoid memory issues
-                if count >= batch_size:
-                    session.commit()
-                    session.flush()
-                    session.expunge_all()
-                    count = 0
+                if not rs_batch:
+                    break
+
+                for rs in rs_batch:
+                    # Cache the active check before potential detachment
+                    if filter:
+                        rs_start = rs.start_date
+                        rs_end = rs.end_date
+                        if not (rs_start and rs_end and rs_start <= date <= rs_end):
+                            continue
+
+                    c = CurrentRouteStops(rs)
+                    session.add(c)
+                    count += 1
+
+                # Commit this batch
+                session.commit()
+                session.flush()
+                session.expunge_all()
+                offset += batch_size
+                count = 0
 
             # Final commit for remaining records
             session.commit()

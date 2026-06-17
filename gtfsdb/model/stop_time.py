@@ -122,6 +122,7 @@ class StopTime(Base):
         populate StopTime.shape_dist_travelled where ever it is missing
         TODO: assumes feet as the measure ... should make this configurable
         """
+        from sqlalchemy.orm import joinedload
         session = db.session()
         try:
             # Process in batches using offset/limit pattern
@@ -132,6 +133,7 @@ class StopTime(Base):
 
             while True:
                 stop_times = (session.query(StopTime)
+                             .options(joinedload(StopTime.stop))
                              .order_by(StopTime.trip_id, StopTime.stop_sequence)
                              .limit(batch_size)
                              .offset(offset)
@@ -141,14 +143,17 @@ class StopTime(Base):
                     break
 
                 for s in stop_times:
-                    # step 0: check data exists
+                    # step 0: check data exists and cache stop data before potential detachment
                     if s is None or s.stop is None or s.trip_id is None:
                         continue
 
+                    stop_lat = s.stop.stop_lat
+                    stop_lon = s.stop.stop_lon
+
                     # step 1: on first iteration or shape change, goto loop again (e.g., need 2 coords to calc distance)
                     if prev_lat is None or trip_id != s.trip_id:
-                        prev_lat = s.stop.stop_lat
-                        prev_lon = s.stop.stop_lon
+                        prev_lat = stop_lat
+                        prev_lon = stop_lon
                         trip_id = s.trip_id
                         distance = s.shape_dist_traveled = 0.0
                         continue
@@ -158,12 +163,12 @@ class StopTime(Base):
                     if s.shape_dist_traveled is None:
                         #msg = "calc dist {}: {},{} to {},{}".format(s.shape_pt_sequence, prev_lat, prev_lon, s.shape_pt_lat, s.shape_pt_lon)
                         #log.debug(msg)
-                        distance += util.distance_ft(prev_lat, prev_lon, s.stop.stop_lat, s.stop.stop_lon)
+                        distance += util.distance_ft(prev_lat, prev_lon, stop_lat, stop_lon)
                         s.shape_dist_traveled = distance
 
                     # step 3 save off these coords (and distance) for next iteration
-                    prev_lat = s.stop.stop_lat
-                    prev_lon = s.stop.stop_lon
+                    prev_lat = stop_lat
+                    prev_lon = stop_lon
                     distance = s.shape_dist_traveled
 
                 # Commit this batch and clear session

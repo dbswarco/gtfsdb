@@ -2,6 +2,7 @@ from collections import defaultdict
 
 from sqlalchemy import Column, Integer, Numeric, String
 from sqlalchemy.orm import joinedload, object_session, relationship
+from sqlalchemy.sql import func
 
 from gtfsdb import config, util
 from gtfsdb.model.base import Base
@@ -249,6 +250,7 @@ class CurrentStops(Base, StopBase):
         :param stop:
         :param session:
         """
+        # Cache all stop attributes before potential detachment
         self.stop_id = stop.stop_id
         self.stop_code = stop.stop_code
         self.stop_name = stop.stop_name
@@ -259,7 +261,7 @@ class CurrentStops(Base, StopBase):
 
         # copy the stop geom to CurrentStops (if we're in is_geospatial mode)
         if hasattr(stop, 'geom') and hasattr(self, 'geom'):
-            self.geom = util.Point.make_geo(stop.stop_lon, stop.stop_lat, config.SRID)
+            self.geom = util.Point.make_geo(self.stop_lon, self.stop_lat, config.SRID)
 
         from .route_stop import CurrentRouteStops
         rs_list = CurrentRouteStops.query_route_short_names(session, stop, filter_active=True)
@@ -309,6 +311,7 @@ class CurrentStops(Base, StopBase):
         """
         will update the current 'view' of this data
         """
+        from sqlalchemy.orm import joinedload
         batch_size = kwargs.get('batch_size', config.DEFAULT_BATCH_SIZE)
         log.info("{0}.post_process: starting with batch size {1}".format(cls.__name__, batch_size))
         session = db.session()
@@ -323,21 +326,44 @@ class CurrentStops(Base, StopBase):
                 date = None
                 filter = False
 
-            stops = Stop.query_active_stops(session, date=date, active_filter=filter)
+            # Process stops in batches instead of loading all at once
+            total_stops = session.query(func.count(Stop.stop_id)).scalar()
+            offset = 0
             count = 0
-            for s in stops:
-                c = CurrentStops(s, session)
-                session.add(c)
-                count += 1
 
-                # Commit in batches to avoid memory issues
-                if count >= batch_size:
-                    session.commit()
-                    session.flush()
-                    session.expunge_all()
-                    count = 0
+            while offset < total_stops:
+                stops_batch = (session.query(Stop)
+                              .options(joinedload(Stop.stop_times))
+                              .order_by(Stop.stop_id)
+                              .limit(batch_size)
+                              .offset(offset)
+                              .all())
 
-            # Final commit for remaining records
+                if not stops_batch:
+                    break
+
+                for s in stops_batch:
+                    # Cache stop data before potential detachment
+                    if filter:
+                        # Check if stop is active
+                        from gtfsdb.model.stop_time import StopTime
+                        st = StopTime.get_departure_schedule(session, s.stop_id, date, limit=1)
+                        if not st or len(st) == 0:
+                            continue
+
+                    # Need a fresh session reference for CurrentStops constructor
+                    c = CurrentStops(s, session)
+                    session.add(c)
+                    count += 1
+
+                # Commit this batch
+                session.commit()
+                session.flush()
+                session.expunge_all()
+                offset += batch_size
+                count = 0
+
+            # Final commit
             session.commit()
             session.flush()
         except Exception as e:

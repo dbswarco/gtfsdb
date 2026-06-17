@@ -2,6 +2,7 @@ import json
 
 from sqlalchemy import Column, String, Integer
 from sqlalchemy.orm import deferred
+from sqlalchemy.sql import func
 
 from gtfsdb import config, util
 from gtfsdb.model.base import Base
@@ -58,40 +59,60 @@ class Location(Base, LocationBase):
          - ...
         """
         from gtfsdb.model.stop_time import StopTime
+        from sqlalchemy.orm import joinedload
 
         batch_size = kwargs.get('batch_size', config.DEFAULT_BATCH_SIZE)
         log.info("{0}.post_process: starting with batch size {1}".format(cls.__name__, batch_size))
         session = db.session
         try:
             rso = {}
-            locs = session.query(Location).all()
-            if locs and len(locs) > 0:
+            total_locs = session.query(func.count(Location.id)).scalar()
+            offset = 0
+
+            while offset < total_locs:
+                locs = (session.query(Location)
+                       .order_by(Location.id)
+                       .limit(batch_size)
+                       .offset(offset)
+                       .all())
+
+                if not locs:
+                    break
+
                 count = 0
                 for i, l in enumerate(locs):
-                    stop_time = session.query(StopTime).filter_by(location_id=l.id).first()
+                    stop_time = (session.query(StopTime)
+                                .options(joinedload(StopTime.trip).joinedload('route'))
+                                .filter_by(location_id=l.id)
+                                .first())
                     if stop_time:
                         #import pdb; pdb.set_trace()
-                        rso[l.route_id] = rso.get(l.route_id) or i  # for the 'default' route sort order below
-                        l.route_id = stop_time.trip.route.route_id
-                        l.route_sort_order = stop_time.trip.route.route_sort_order or rso.get(l.route_id) or 1
+                        # Cache route data before potential detachment
+                        route_id = stop_time.trip.route.route_id
+                        route_sort_order = stop_time.trip.route.route_sort_order
+                        route_name = stop_time.trip.route.route_name
+                        route_color = stop_time.trip.route.route_color
+                        route_text_color = stop_time.trip.route.route_text_color
+
+                        rso[route_id] = rso.get(route_id) or (offset + i)  # for the 'default' route sort order below
+                        l.route_id = route_id
+                        l.route_sort_order = route_sort_order or rso.get(route_id) or 1
                         l.render_order = RSO_MAX - l.route_sort_order
-                        l.region_name = stop_time.trip.route.route_name
-                        l.region_color = stop_time.trip.route.route_color
-                        l.text_color = stop_time.trip.route.route_text_color
+                        l.region_name = route_name
+                        l.region_color = route_color
+                        l.text_color = route_text_color
                         session.merge(l)
                         count += 1
 
-                        # Commit in batches to avoid memory issues
-                        if count >= batch_size:
-                            session.commit()
-                            session.flush()
-                            session.expunge_all()
-                            count = 0
+                # Commit this batch
+                session.commit()
+                session.flush()
+                session.expunge_all()
+                offset += batch_size
 
-                # Final commit for remaining records
-                if count > 0:
-                    session.commit()
-                    session.flush()
+            # Final commit
+            session.commit()
+            session.flush()
         except Exception as e:
             log.error(e)
         finally:

@@ -137,7 +137,10 @@ class Route(Base, RouteBase):
 
     def _calc_frequency(self):
         # TODO: do better here...
-        self.is_frequent = len(self.trips) > 50
+        trips_count = getattr(self, '_cached_trips_count', None)
+        if trips_count is None:
+            trips_count = len(list(self.trips)) if self.trips else 0
+        self.is_frequent = trips_count > 50
 
     def _fix_colors(self):
         # step 0: default colors
@@ -173,28 +176,66 @@ class Route(Base, RouteBase):
 
     @classmethod
     def post_process(cls, db, **kwargs):
+        from sqlalchemy.orm import joinedload
         # import pdb; pdb.set_trace()
         batch_size = kwargs.get('batch_size', config.DEFAULT_BATCH_SIZE)
         log.info("{0}.post_process: starting with batch size {1}".format(cls.__name__, batch_size))
         start_time = time.time()
         session = db.session
 
-        route_list = session.query(Route).all()
-        cls._load_geoms(db, route_list)
-        count = 0
-        for route in route_list:
-            route.route_name  # populate route_label column
-            route._calc_frequency()
-            route._fix_colors()
-            session.merge(route)
-            count += 1
+        # Get total count for batching
+        total_routes = session.query(func.count(Route.route_id)).scalar()
+        offset = 0
 
-            # Commit in batches to avoid memory issues
-            if count >= batch_size:
-                session.commit()
-                session.flush()
-                session.expunge_all()
-                count = 0
+        # Collect all routes for _load_geoms (it needs the full list)
+        all_routes = []
+        temp_offset = 0
+        while temp_offset < total_routes:
+            routes_batch = (session.query(Route)
+                           .order_by(Route.route_id)
+                           .limit(batch_size)
+                           .offset(temp_offset)
+                           .all())
+            if not routes_batch:
+                break
+            all_routes.extend(routes_batch)
+            temp_offset += batch_size
+
+        cls._load_geoms(db, all_routes)
+        session.commit()
+        session.flush()
+        session.expunge_all()
+
+        # Now process routes in batches with eager loading
+        offset = 0
+        count = 0
+        while offset < total_routes:
+            route_list = (session.query(Route)
+                         .options(joinedload(Route.trips))
+                         .order_by(Route.route_id)
+                         .limit(batch_size)
+                         .offset(offset)
+                         .all())
+
+            if not route_list:
+                break
+
+            for route in route_list:
+                # Cache trips count before potential detachment
+                trips_count = len(list(route.trips)) if route.trips else 0
+                route._cached_trips_count = trips_count
+
+                route.route_name  # populate route_label column
+                route._calc_frequency()
+                route._fix_colors()
+                session.merge(route)
+                count += 1
+
+            # Commit this batch
+            session.commit()
+            session.flush()
+            session.expunge_all()
+            offset += batch_size
 
         # Final commit for remaining records
         session.commit()
@@ -225,6 +266,7 @@ class CurrentRoutes(Base, RouteBase):
 
     def __init__(self, route, def_order):
         self.route_id = route.route_id
+        # Access route_sort_order before potential detachment
         self.route_sort_order = route.route_sort_order if route.route_sort_order else def_order
 
     def is_active(self, date=None):
@@ -279,6 +321,7 @@ class CurrentRoutes(Base, RouteBase):
         SORT_ORDER_OFFSET = 1000001
 
         num_inserts = 0        
+        total_inserts = 0
         try:
             session.query(CurrentRoutes).delete()
 
@@ -290,13 +333,17 @@ class CurrentRoutes(Base, RouteBase):
                 date = None
                 filter = False
 
-            cr_list = []
+            # First pass: create all CurrentRoutes records
             rte_list = Route.query_active_routes(session, date, filter)
             for i, r in enumerate(rte_list):
+                # Cache route data before potential detachment
+                route_id = r.route_id
+                route_sort_order = r.route_sort_order
+
                 c = CurrentRoutes(r, SORT_ORDER_OFFSET + i)
-                cr_list.append(c)
                 session.add(c)
                 num_inserts += 1
+                total_inserts += 1
 
                 # Commit in batches to avoid memory issues
                 if num_inserts >= batch_size:
@@ -304,13 +351,17 @@ class CurrentRoutes(Base, RouteBase):
                     session.flush()
                     session.expunge_all()
                     num_inserts = 0
-                    cr_list = []  # Reset list since we've cleared session
 
-            #import pdb; pdb.set_trace()
-            if cr_list:  # Only load geoms if we have items left
+            # Commit remaining
+            session.commit()
+            session.flush()
+
+            # Second pass: load geoms for all current routes
+            cr_list = session.query(CurrentRoutes).all()
+            if cr_list:
                 cls._load_geoms(db, cr_list, date)
 
-            # Final commit for remaining records
+            # Final commit for geoms
             session.commit()
             session.flush()
         except Exception as e:
@@ -319,7 +370,7 @@ class CurrentRoutes(Base, RouteBase):
         finally:
             session.flush()
             session.close()
-        if num_inserts == 0:
+        if total_inserts == 0:
             log.warning("CurrentRoutes did not insert any route records...hmmmm...")
 
 

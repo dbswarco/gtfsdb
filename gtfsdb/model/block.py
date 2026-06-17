@@ -3,6 +3,7 @@ import time
 
 from sqlalchemy import Column, Sequence
 from sqlalchemy.orm import relationship
+from sqlalchemy.sql import func
 from sqlalchemy.types import Integer, String
 
 from gtfsdb import config
@@ -115,15 +116,48 @@ class Block(Base):
         """
         loop thru a full trip table and break things into buckets based on service key and block id
         """
+        from sqlalchemy.orm import joinedload
         start_time = time.time()
         num_recs = 0
 
-        # step 1: loop thru all trips, sorted by block and service key
-        trips = db.session.query(Trip).order_by(Trip.block_id, Trip.service_id).all()
+        # step 1: loop thru all trips in batches, sorted by block and service key
+        total_trips = db.session.query(func.count(Trip.trip_id)).scalar()
+        offset = 0
+
+        # Load all trips with eager loading of stop_times for start/end stops
+        all_trips = []
+        while offset < total_trips:
+            trips_batch = (db.session.query(Trip)
+                          .options(joinedload(Trip.stop_times))
+                          .order_by(Trip.block_id, Trip.service_id, Trip.trip_id)
+                          .limit(batch_size)
+                          .offset(offset)
+                          .all())
+
+            if not trips_batch:
+                break
+
+            # Cache necessary data before potential detachment
+            for t in trips_batch:
+                if t.stop_times and len(t.stop_times) > 0:
+                    t._cached_start_stop_id = t.stop_times[0].stop_id if t.stop_times[0].stop else None
+                    t._cached_end_stop_id = t.stop_times[-1].stop_id if t.stop_times[-1].stop else None
+                    t._cached_start_time = t.stop_times[0].departure_time
+                    t._cached_is_valid = len(t.stop_times) >= 2
+                else:
+                    t._cached_start_stop_id = None
+                    t._cached_end_stop_id = None
+                    t._cached_start_time = None
+                    t._cached_is_valid = False
+
+            all_trips.extend(trips_batch)
+            offset += batch_size
+
+        trips = all_trips
         i = 0
         while i < len(trips):
             # make sure the trip has a couple stops
-            if not trips[i].is_valid:
+            if not trips[i]._cached_is_valid:
                 i = i + 1
                 continue
 
@@ -138,7 +172,7 @@ class Block(Base):
             # step 2: grab a batch of trips that have the same block and service id
             t = []
             while i < len(trips):
-                if not trips[i].is_valid:
+                if not trips[i]._cached_is_valid:
                     i = i + 1
                     continue
 
@@ -148,24 +182,20 @@ class Block(Base):
                 i = i + 1
 
             # step 3: sort our bucket
-            sorted_blocks = sorted(t, key=lambda t: t.start_time)
+            sorted_blocks = sorted(t, key=lambda t: t._cached_start_time or '')
             sb_len = len(sorted_blocks) - 1
 
             # step 4: create block objects
             for j, k in enumerate(sorted_blocks):
-                # check for missing start or end stops separately
-                start_stop_id = None
-                end_stop_id = None
+                # Use cached stop IDs
+                start_stop_id = k._cached_start_stop_id
+                end_stop_id = k._cached_end_stop_id
 
-                if k.start_stop is None:
+                if start_stop_id is None:
                     log.warning('Trip {0} has missing start_stop'.format(k.trip_id))
-                else:
-                    start_stop_id = k.start_stop.stop_id
 
-                if k.end_stop is None:
+                if end_stop_id is None:
                     log.warning('Trip {0} has missing end_stop'.format(k.trip_id))
-                else:
-                    end_stop_id = k.end_stop.stop_id
 
                 # skip only if both are missing
                 if start_stop_id is None and end_stop_id is None:

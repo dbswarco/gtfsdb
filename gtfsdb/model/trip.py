@@ -78,9 +78,9 @@ class Trip(Base):
             .subquery()
         )
 
-        # Get invalid trip IDs in batches
+        # Get invalid trip IDs and stop counts in one query to avoid detachment issues
         invalid_trips_query = (
-            db.session.query(Trip.trip_id)
+            db.session.query(Trip.trip_id, subquery.c.stop_count)
             .join(subquery, Trip.trip_id == subquery.c.trip_id)
         )
 
@@ -91,16 +91,11 @@ class Trip(Base):
             if not batch:
                 break
 
-            for trip_row in batch:
-                # Get stop count for this specific trip
-                stop_count = db.session.query(func.count(StopTime.stop_sequence)).filter(
-                    StopTime.trip_id == trip_row.trip_id
-                ).scalar()
-
+            for trip_id, stop_count in batch:
                 log.warning(
                     "invalid trip: {0} only has {1} stop_time record (i.e., maybe the stops are coded as "
                     "non-public, and thus their stop time records didn't make it into the gtfs)".format(
-                        trip_row.trip_id, stop_count
+                        trip_id, stop_count
                     )
                 )
 
@@ -112,11 +107,15 @@ class Trip(Base):
     @classmethod
     def query_trip(cls, session, trip_id, schema=None):
         """ return a trip via trip_id """
+        from sqlalchemy.orm import joinedload
         ret_val = None
         try:
             if schema:
                 Trip.set_schema(schema)
-            ret_val = session.query(Trip).filter(Trip.trip_id==trip_id).one()
+            ret_val = (session.query(Trip)
+                      .options(joinedload(Trip.stop_times))
+                      .filter(Trip.trip_id==trip_id)
+                      .one())
         except:
             log.debug(session.query(Trip).filter(Trip.trip_id==trip_id))
 
