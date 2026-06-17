@@ -309,6 +309,8 @@ class CurrentStops(Base, StopBase):
         """
         will update the current 'view' of this data
         """
+        batch_size = kwargs.get('batch_size', config.DEFAULT_BATCH_SIZE)
+        log.info("{0}.post_process: starting with batch size {1}".format(cls.__name__, batch_size))
         session = db.session()
         try:
             session.query(CurrentStops).delete()
@@ -322,10 +324,20 @@ class CurrentStops(Base, StopBase):
                 filter = False
 
             stops = Stop.query_active_stops(session, date=date, active_filter=filter)
+            count = 0
             for s in stops:
                 c = CurrentStops(s, session)
                 session.add(c)
+                count += 1
 
+                # Commit in batches to avoid memory issues
+                if count >= batch_size:
+                    session.commit()
+                    session.flush()
+                    session.expunge_all()
+                    count = 0
+
+            # Final commit for remaining records
             session.commit()
             session.flush()
         except Exception as e:

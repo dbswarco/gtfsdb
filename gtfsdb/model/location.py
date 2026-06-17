@@ -59,11 +59,14 @@ class Location(Base, LocationBase):
         """
         from gtfsdb.model.stop_time import StopTime
 
+        batch_size = kwargs.get('batch_size', config.DEFAULT_BATCH_SIZE)
+        log.info("{0}.post_process: starting with batch size {1}".format(cls.__name__, batch_size))
         session = db.session
         try:
             rso = {}
             locs = session.query(Location).all()
             if locs and len(locs) > 0:
+                count = 0
                 for i, l in enumerate(locs):
                     stop_time = session.query(StopTime).filter_by(location_id=l.id).first()
                     if stop_time:
@@ -76,6 +79,19 @@ class Location(Base, LocationBase):
                         l.region_color = stop_time.trip.route.route_color
                         l.text_color = stop_time.trip.route.route_text_color
                         session.merge(l)
+                        count += 1
+
+                        # Commit in batches to avoid memory issues
+                        if count >= batch_size:
+                            session.commit()
+                            session.flush()
+                            session.expunge_all()
+                            count = 0
+
+                # Final commit for remaining records
+                if count > 0:
+                    session.commit()
+                    session.flush()
         except Exception as e:
             log.error(e)
         finally:

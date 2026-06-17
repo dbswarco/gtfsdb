@@ -105,17 +105,17 @@ class Block(Base):
     @classmethod
     def post_process(cls, db, **kwargs):
         ignore_blocks = kwargs.get('ignore_blocks', None)
-        log.debug('{0} {1}.post_process'.format("skip" if ignore_blocks else "run", cls.__name__))
+        batch_size = kwargs.get('batch_size', config.DEFAULT_BATCH_SIZE)
+        log.info("{0} {1}.post_process: starting with batch size {2}".format("skip" if ignore_blocks else "run", cls.__name__, batch_size))
         if not ignore_blocks:
-            cls.populate(db)
+            cls.populate(db, batch_size)
 
     @classmethod
-    def populate(cls, db):
+    def populate(cls, db, batch_size=config.DEFAULT_BATCH_SIZE):
         """
         loop thru a full trip table and break things into buckets based on service key and block id
         """
         start_time = time.time()
-        batch_size = config.DEFAULT_BATCH_SIZE
         num_recs = 0
 
         # step 1: loop thru all trips, sorted by block and service key
@@ -201,6 +201,9 @@ class Block(Base):
         # step 5b: (final) insert into the db
         db.session.flush()
         db.session.commit()
+
+        # Clear session to free memory
+        db.session.expunge_all()
 
         processing_time = time.time() - start_time
         log.debug('{0}.populate ({1:.0f} seconds)'.format(cls.__name__, processing_time))

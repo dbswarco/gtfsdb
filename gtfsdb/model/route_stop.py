@@ -136,11 +136,12 @@ class RouteStop(Base, RouteStopBase):
 
     @classmethod
     def post_process(cls, db, **kwargs):
-        log.debug('{0}.post_process'.format(cls.__name__))
-        cls.populate(db.session)
+        batch_size = kwargs.get('batch_size', config.DEFAULT_BATCH_SIZE)
+        log.info("{0}.post_process: starting with batch size {1}".format(cls.__name__, batch_size))
+        cls.populate(db.session, batch_size)
 
     @classmethod
-    def populate(cls, session):
+    def populate(cls, session, batch_size=config.DEFAULT_BATCH_SIZE):
         """
         for each route/direction, find list of stop_ids for route/direction pairs
 
@@ -232,6 +233,9 @@ class RouteStop(Base, RouteStopBase):
             # step 8: commit the new records to the db for this route...
             sys.stdout.write('*')
             session.commit()
+
+            # Clear session to free memory
+            session.expunge_all()
 
         # step 9: final commit for any stragglers
         session.commit()
@@ -368,6 +372,8 @@ class CurrentRouteStops(Base, RouteStopBase):
         """
         will update the current 'view' of this data
         """
+        batch_size = kwargs.get('batch_size', config.DEFAULT_BATCH_SIZE)
+        log.info("{0}.post_process: starting with batch size {1}".format(cls.__name__, batch_size))
         session = db.session()
         try:
             session.query(CurrentRouteStops).delete()
@@ -381,13 +387,23 @@ class CurrentRouteStops(Base, RouteStopBase):
                 filter = False
 
             rs_list = session.query(RouteStop).all()
+            count = 0
             for rs in rs_list:
                 if filter and not rs.is_active(date):
                     continue
 
                 c = CurrentRouteStops(rs)
                 session.add(c)
+                count += 1
 
+                # Commit in batches to avoid memory issues
+                if count >= batch_size:
+                    session.commit()
+                    session.flush()
+                    session.expunge_all()
+                    count = 0
+
+            # Final commit for remaining records
             session.commit()
             session.flush()
         except Exception as e:

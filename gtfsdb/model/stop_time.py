@@ -111,24 +111,35 @@ class StopTime(Base):
 
     @classmethod
     def post_process(cls, db, **kwargs):
-        log.debug('{0}.post_process'.format(cls.__name__))
-        cls.populate_shape_dist_traveled(db)
+        batch_size = kwargs.get('batch_size', config.DEFAULT_BATCH_SIZE)
+        log.info("{0}.post_process: starting with batch size {1}".format(cls.__name__, batch_size))
+        cls.populate_shape_dist_traveled(db, batch_size)
         # cls.null_out_last_stop_departures(db) ## commented out due to other processes
 
     @classmethod
-    def populate_shape_dist_traveled(cls, db):
+    def populate_shape_dist_traveled(cls, db, batch_size=config.DEFAULT_BATCH_SIZE):
         """
         populate StopTime.shape_dist_travelled where ever it is missing
         TODO: assumes feet as the measure ... should make this configurable
         """
         session = db.session()
         try:
-            stop_times = session.query(StopTime).order_by(StopTime.trip_id, StopTime.stop_sequence).all()
-            if stop_times:
-                trip_id = "-111"
-                prev_lat = prev_lon = None
-                distance = 0.0
-                count = 0
+            # Process in batches using offset/limit pattern
+            offset = 0
+            trip_id = "-111"
+            prev_lat = prev_lon = None
+            distance = 0.0
+
+            while True:
+                stop_times = (session.query(StopTime)
+                             .order_by(StopTime.trip_id, StopTime.stop_sequence)
+                             .limit(batch_size)
+                             .offset(offset)
+                             .all())
+
+                if not stop_times:
+                    break
+
                 for s in stop_times:
                     # step 0: check data exists
                     if s is None or s.stop is None or s.trip_id is None:
@@ -149,18 +160,18 @@ class StopTime(Base):
                         #log.debug(msg)
                         distance += util.distance_ft(prev_lat, prev_lon, s.stop.stop_lat, s.stop.stop_lon)
                         s.shape_dist_traveled = distance
-                        count += 0
 
                     # step 3 save off these coords (and distance) for next iteration
                     prev_lat = s.stop.stop_lat
                     prev_lon = s.stop.stop_lon
                     distance = s.shape_dist_traveled
 
-                    # step 4 persist every now and then not to build a big buffer
-                    if count >= 10000:
-                        session.commit()
-                        session.flush()
-                        count = 0
+                # Commit this batch and clear session
+                session.commit()
+                session.flush()
+                session.expunge_all()
+
+                offset += batch_size
 
         except Exception as e:
             log.error(e)

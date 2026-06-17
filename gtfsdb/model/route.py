@@ -174,17 +174,29 @@ class Route(Base, RouteBase):
     @classmethod
     def post_process(cls, db, **kwargs):
         # import pdb; pdb.set_trace()
-        log.debug('{0}.post_process'.format(cls.__name__))
+        batch_size = kwargs.get('batch_size', config.DEFAULT_BATCH_SIZE)
+        log.info("{0}.post_process: starting with batch size {1}".format(cls.__name__, batch_size))
         start_time = time.time()
         session = db.session
 
         route_list = session.query(Route).all()
         cls._load_geoms(db, route_list)
+        count = 0
         for route in route_list:
             route.route_name  # populate route_label column
             route._calc_frequency()
             route._fix_colors()
             session.merge(route)
+            count += 1
+
+            # Commit in batches to avoid memory issues
+            if count >= batch_size:
+                session.commit()
+                session.flush()
+                session.expunge_all()
+                count = 0
+
+        # Final commit for remaining records
         session.commit()
         session.flush()
         processing_time = time.time() - start_time
@@ -261,6 +273,8 @@ class CurrentRoutes(Base, RouteBase):
           6. commit
           7. close transaction
         """
+        batch_size = kwargs.get('batch_size', config.DEFAULT_BATCH_SIZE)
+        log.info("{0}.post_process: starting with batch size {1}".format(cls.__name__, batch_size))
         session = db.session()
         SORT_ORDER_OFFSET = 1000001
 
@@ -283,10 +297,20 @@ class CurrentRoutes(Base, RouteBase):
                 cr_list.append(c)
                 session.add(c)
                 num_inserts += 1
-            
-            #import pdb; pdb.set_trace()
-            cls._load_geoms(db, cr_list, date)
 
+                # Commit in batches to avoid memory issues
+                if num_inserts >= batch_size:
+                    session.commit()
+                    session.flush()
+                    session.expunge_all()
+                    num_inserts = 0
+                    cr_list = []  # Reset list since we've cleared session
+
+            #import pdb; pdb.set_trace()
+            if cr_list:  # Only load geoms if we have items left
+                cls._load_geoms(db, cr_list, date)
+
+            # Final commit for remaining records
             session.commit()
             session.flush()
         except Exception as e:
