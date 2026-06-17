@@ -1,8 +1,10 @@
 import logging
 
+import psutil
+
 from gtfsdb import config
 from gtfsdb.model.base import Base
-from sqlalchemy import Column
+from sqlalchemy import Column, func
 from sqlalchemy.orm import relationship
 from sqlalchemy.types import Integer, String
 
@@ -61,11 +63,53 @@ class Trip(Base):
 
     @classmethod
     def post_process(cls, db, **kwargs):
-        trips = db.session.query(Trip).all()
-        for t in trips:
-            if not t.is_valid:
-                log.warning("invalid trip: {0} only has {1} stop_time record (i.e., maybe the stops are coded as "
-                  "non-public, and thus their stop time records didn't make it into the gtfs)".format(t.trip_id, t.trip_len))
+        from gtfsdb.model.stop_time import StopTime
+
+        batch_size = kwargs.get('batch_size', config.DEFAULT_BATCH_SIZE)
+        log.info("Trip.post_process: validating trips with batch size {}".format(batch_size))
+
+        # Use SQL aggregation to find invalid trips (those with < 2 stop_times) efficiently
+        # This avoids loading all trip and stop_time data into memory
+        subquery = (
+            db.session.query(
+                StopTime.trip_id,
+                func.count(StopTime.stop_sequence).label('stop_count')
+            )
+            .group_by(StopTime.trip_id)
+            .having(func.count(StopTime.stop_sequence) < 2)
+            .subquery()
+        )
+
+        # Get invalid trip IDs in batches
+        invalid_trips_query = (
+            db.session.query(Trip.trip_id)
+            .join(subquery, Trip.trip_id == subquery.c.trip_id)
+        )
+
+        # Process in batches to avoid memory issues
+        offset = 0
+        while True:
+            batch = invalid_trips_query.limit(batch_size).offset(offset).all()
+            if not batch:
+                break
+
+            for trip_row in batch:
+                # Get stop count for this specific trip
+                stop_count = db.session.query(func.count(StopTime.stop_sequence)).filter(
+                    StopTime.trip_id == trip_row.trip_id
+                ).scalar()
+
+                log.warning(
+                    "invalid trip: {0} only has {1} stop_time record (i.e., maybe the stops are coded as "
+                    "non-public, and thus their stop time records didn't make it into the gtfs)".format(
+                        trip_row.trip_id, stop_count
+                    )
+                )
+
+            offset += batch_size
+
+            # Clear session to free memory
+            db.session.expunge_all()
 
     @classmethod
     def query_trip(cls, session, trip_id, schema=None):
