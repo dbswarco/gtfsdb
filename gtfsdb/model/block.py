@@ -191,15 +191,14 @@ class Block(Base):
                 start_stop_id = k._cached_start_stop_id
                 end_stop_id = k._cached_end_stop_id
 
-                if start_stop_id is None:
-                    log.warning('Trip {0} has missing start_stop'.format(k.trip_id))
-
-                if end_stop_id is None:
-                    log.warning('Trip {0} has missing end_stop'.format(k.trip_id))
-
-                # skip only if both are missing
-                if start_stop_id is None and end_stop_id is None:
-                    log.warning('Trip {0} has missing both start_stop and end_stop, skipping block creation'.format(k.trip_id))
+                # Skip if either start or end stop is missing (both are NOT NULL in schema)
+                if start_stop_id is None or end_stop_id is None:
+                    if start_stop_id is None and end_stop_id is None:
+                        log.warning('Trip {0} has missing both start_stop and end_stop, skipping block creation'.format(k.trip_id))
+                    elif start_stop_id is None:
+                        log.warning('Trip {0} has missing start_stop, skipping block creation'.format(k.trip_id))
+                    else:
+                        log.warning('Trip {0} has missing end_stop, skipping block creation'.format(k.trip_id))
                     continue
 
                 prev = None
